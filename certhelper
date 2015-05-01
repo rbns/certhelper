@@ -1,0 +1,250 @@
+#!/usr/bin/env python
+
+# Copyright (c) 2014, Ruben Schuller All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+# 
+# 1. Redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer.
+# 
+# 2. Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import hashlib
+import os
+import os.path
+import shlex
+import shutil
+import subprocess
+import argparse
+
+class CerthelperException(Exception):
+    pass
+
+class Certstore():
+    def __init__(self, path):
+        '''Initialize the certificate storage.'''
+        self.location = path
+        self.name = self.name + " [" + self.location + "]"
+
+        if not (os.path.isdir(self.location) and \
+            os.access(self.location, os.R_OK|os.W_OK|os.X_OK)):
+            raise CerthelperException("Can't access storage directory.")
+
+    def add(self, path):
+        raise CerthelperException("Implement me!")
+
+    def remove(self, path):
+        raise CerthelperException("Implement me!")
+
+    def copy(self, path):
+        '''Copys a certificate into the certificate storage.'''
+
+        if not os.access(path, os.F_OK | os.R_OK):
+            raise CerthelperException("Can't access certificate file.")
+    
+        if os.access(os.path.join(self.location, os.path.basename(path)), os.F_OK):
+            raise CerthelperException("Certificate already exists in certstore.")
+    
+        shutil.copy(path, self.location)
+
+    def identic(self, path):
+        '''Test if the certificate file in the storage is the same as the reference'''
+
+        storage_path = os.path.join(self.location, os.path.basename(path))
+        original_hash = ''
+        storage_hash = ''
+
+        try:
+            with open(path, 'r') as f:
+                content = f.read()
+                s = hashlib.sha256()
+                s.update(content)
+                original_hash = s.digest()
+        except IOError:
+            raise CerthelperException("Can't access certificate file.")
+
+        try:
+            with open(storage_path, 'r') as f:
+                content = f.read()
+                s = hashlib.sha256()
+                s.update(content)
+                storage_hash = s.digest()
+        except IOError:
+            raise CerthelperException("Certificate file doesn't exist in the store.")
+
+        return original_hash == storage_hash
+
+class OpenSSL(Certstore):
+    name = "OpenSSL"
+    openssl_hash_call = 'openssl x509 -noout -hash -in {cert}'
+
+    def add(self,path):
+        '''Add a certificate by copying it and creating a hash-named symlink to it.'''
+        self.copy(path)
+        os.symlink(os.path.join(self.location, path), os.path.join(self.location, self.__hash(path) + '.0'))
+
+    def remove(self,path):
+        '''Remove a certificate and its hash-symlink.'''
+        if self.identic(path):
+            cert_link = os.path.join(self.location, self.__hash(path) + '.0')
+            storage_path = os.path.join(self.location, os.path.basename(path))
+            os.remove(cert_link)
+            os.remove(storage_path)
+        else:
+            raise CerthelperException("Couldn't find the right certificate!")
+
+    def check(self,path):
+        '''Check if the certificate and it's symlink exist.
+        
+        It does not check if the symlink links to the certificate.'''
+        cert_link = os.path.join(self.location, self.__hash(path) + '.0')
+        storage_path = os.path.join(self.location, os.path.basename(path))
+
+        if os.access(cert_link, os.F_OK | os.R_OK) and os.access(storage_path, os.F_OK | os.R_OK):
+            return True
+
+        return False
+
+    def __hash(self,path):
+        '''Get the hash-value used by OpenSSL to find the certificates.'''
+        cmd = self.openssl_hash_call.format(cert=path)
+        return subprocess.check_output(shlex.split(cmd)).strip()
+
+
+class Mozilla(Certstore):
+    name = "Mozilla"
+    certutil_add = 'certutil -A -n "{name}" -t "TC,TC,TC" -d {store} -i {cert}'
+    certutil_del = 'certutil -D -n "{name}" -d {store}'
+    certutil_check = 'certutil -L -n "{name}" -d {store}'
+    openssl_name = 'openssl x509 -noout -subject -in {cert}'
+
+    def add(self, path):
+        '''Add a certificate, using the CN as "nickname"'''
+
+        cmd = self.certutil_add.format(name=self.__name(path), store=self.location, cert=path)
+        subprocess.check_output(shlex.split(cmd))
+
+    def remove(self, path):
+        '''Remove a certificate, selected by the CN as "nickname"'''
+
+        cmd = self.certutil_del.format(name=self.__name(path), store=self.location)
+        try:
+            subprocess.check_output(shlex.split(cmd))
+        except subprocess.CalledProcessError:
+            raise CerthelperException("Can't delete the certificate as it's not installed.")
+
+    def check(self,path):
+        '''Checks for the presence of a certificate with the CN of the certificate called with.'''
+
+        cmd = self.certutil_check.format(name=self.__name(path), store=self.location)
+        try:
+            subprocess.check_output(shlex.split(cmd))
+        except subprocess.CalledProcessError:
+            return False
+
+        return True
+
+    def __name(self,path):
+        '''Get the CN of a certificate as identifier.'''
+        cmd = self.openssl_name.format(cert=path)
+        output = subprocess.check_output(shlex.split(cmd)).strip()
+        
+        name = ''
+        for x in output.split('/'):
+            if x.startswith('CN='):
+                name = x.split('=')[1]
+
+        return name
+
+
+class Telepathy(Certstore):
+    name = "Telepathy"
+
+    def add(self, path):
+        '''Add a certificate by copying it.'''
+        self.copy(path)
+
+    def remove(self,path):
+        '''Remove a certificate by deleting it.'''
+        if self.identic(path):
+            storage_path = os.path.join(self.location, os.path.basename(path))
+            os.remove(storage_path)
+        else:
+            raise CerthelperException("Couldn't find the right certificate!")
+
+    def check(self,path):
+        '''Check if the certificate exists.'''
+        storage_path = os.path.join(self.location, os.path.basename(path))
+
+        if os.access(storage_path, os.F_OK | os.R_OK):
+            return True
+
+        return False
+
+
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(description='Add and remove certificates to various types of certificate stores.')
+    
+    parser.add_argument('certs', metavar='PATH', help='path of the certificate to add or remove (removal uses this to find the right certificate in the stores)', type=str, nargs='+')
+
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--add','-a', help='add a certificate', action='store_true')
+    group.add_argument('--remove','-r', help='remove a certificate', action='store_true')
+    group.add_argument('--check','-c', help='check for existance of a certificate', action='store_true')
+
+    parser.add_argument('--openssl','-o', help='enable openssl store', action='store_true')
+    parser.add_argument('--mozilla','-m', help='enable mozilla store', action='store_true')
+    parser.add_argument('--telepathy','-t', help='enable telepathy store', action='store_true')
+    parser.add_argument('--openssl-location','-O', help='location of the openssl store', default='/etc/pki/tls/certs/')
+    parser.add_argument('--mozilla-location','-M', help='location of the mozilla store', default='/home/nemo/.mozilla/mozembed')
+    parser.add_argument('--telepathy-location','-T', help='location of the telepathy store', default='/home/nemo/.config/telepathy/certs/')
+
+    args = parser.parse_args()
+    
+    stores = []
+
+    if args.openssl:
+        stores.append(OpenSSL(args.openssl_location))
+
+    if args.mozilla:
+        stores.append(Mozilla(args.mozilla_location))
+
+    if args.telepathy:
+        stores.append(Telepathy(args.telepathy_location))
+
+    for cert in args.certs:
+        for store in stores:
+            if args.add:
+                try:
+                    store.add(cert)
+                except CerthelperException as e:
+                    print str(e)
+            elif args.remove:
+                try:
+                    store.remove(cert)
+                except CerthelperException as e:
+                    print str(e)
+            elif args.check:
+                try:
+                    print store.name + ": " + str(store.check(cert))
+                except CerthelperException as e:
+                    print str(e)
+            else:
+                raise CerthelperException("I don't know what to do.")
+
